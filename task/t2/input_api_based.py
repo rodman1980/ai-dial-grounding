@@ -1,16 +1,25 @@
+import asyncio
 from enum import StrEnum
 from typing import Any
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import SystemMessagePromptTemplate, ChatPromptTemplate
 from langchain_openai import AzureChatOpenAI
-from openai import BaseModel
-from pydantic import SecretStr, Field
+from pydantic import BaseModel, SecretStr, Field
 from task._constants import DIAL_URL, API_KEY
 from task.user_client import UserClient
 
-#TODO:
-# Before implementation open the `api_based_grounding.png` to see the flow of app
+# Initialize AzureChatOpenAI client
+llm_client = AzureChatOpenAI(
+    temperature=0.0,
+    azure_deployment='gpt-4o',
+    azure_endpoint=DIAL_URL,
+    api_key=SecretStr(API_KEY),
+    api_version="",
+)
+
+# Initialize UserClient
+user_client = UserClient()
 
 QUERY_ANALYSIS_PROMPT = """You are a query analysis system that extracts search parameters from user questions about users.
 
@@ -59,9 +68,26 @@ USER_PROMPT = """## RAG CONTEXT:
 {query}"""
 
 
+class SearchField(StrEnum):
+    name = "name"
+    surname = "surname"
+    email = "email"
+
+    def _generate_next_value_(name, start, count, last_values):
+        return name
+
+
+class SearchRequest(BaseModel):
+    search_field: SearchField = Field(..., description="Field to search by (name, surname, email)")
+    search_value: str = Field(..., description="Value to search for")
+
+
+class SearchRequests(BaseModel):
+    search_request_parameters: list[SearchRequest] = Field(default_factory=list)
+
+
 #TODO:
-# 1. Create AzureChatOpenAI client
-# 2. Create UserClient
+# Before implementation open the `api_based_grounding.png` to see the flow of app
 
 
 #TODO:
@@ -78,65 +104,135 @@ USER_PROMPT = """## RAG CONTEXT:
 
 def retrieve_context(user_question: str) -> list[dict[str, Any]]:
     """Extract search parameters from user query and retrieve matching users."""
-    #TODO:
-    # 1. Create PydanticOutputParser with `pydantic_object=SearchRequests` as `parser`
-    # 2. Create messages array with:
-    #       - use SystemMessagePromptTemplate and from template generate system message from QUERY_ANALYSIS_PROMPT
-    #       - user message
-    # 3. Generate `prompt`: `ChatPromptTemplate.from_messages(messages=messages).partial(format_instructions=parser.get_format_instructions())`
-    # 4. Invoke it: `(prompt | llm_client | parser).invoke({})` as `search_requests: SearchRequests` (you are using LCEL)
-    # 5. If `search_requests` has `search_request_parameters`:
-    #       - create `requests_dict`
-    #       - iterate through searched parameters and:
-    #           - add to `requests_dict` the `search_request.search_field.value` as key and `search_request.search_value` as value
-    #       - print `requests_dict`
-    #       - search users (**requests_dict) with `user_client`
-    #       - return users that you found
-    # 6. Otherwise print 'No specific search parameters found!' and return empty array
-    raise NotImplementedError
+    print(f"User question: {user_question}")
+
+    # Create PydanticOutputParser
+    parser = PydanticOutputParser(pydantic_object=SearchRequests)
+
+    # Generate format instructions explicitly
+    format_instructions = parser.get_format_instructions()
+    print(f"Format instructions: {format_instructions}")  # Debugging output
+
+    # Create SystemMessagePromptTemplate with format_instructions placeholder
+    system_prompt_template = SystemMessagePromptTemplate.from_template(QUERY_ANALYSIS_PROMPT)
+    
+    # Create messages array with the template (not yet formatted)
+    messages = [
+        system_prompt_template,
+        HumanMessage(content=user_question)
+    ]
+
+    # Generate prompt and inject format_instructions
+    prompt = ChatPromptTemplate.from_messages(messages=messages).partial(format_instructions=format_instructions)
+    print(f"Generated prompt: {prompt}")
+
+    # Invoke LLM
+    try:
+        search_requests: SearchRequests = (prompt | llm_client | parser).invoke({})
+        print(f"Parsed search requests: {search_requests}")
+
+        if search_requests.search_request_parameters:
+            requests_dict = {}
+            for search_request in search_requests.search_request_parameters:
+                requests_dict[search_request.search_field.value] = search_request.search_value
+
+            print(f"Search parameters: {requests_dict}")
+
+            # Search users
+            users = user_client.search_users(**requests_dict)
+            print(f"Users found: {users}")
+            return users
+        else:
+            print("No specific search parameters found!")
+            return []
+    except Exception as e:
+        print(f"Error during context retrieval: {e}")
+        return []
 
 
 def augment_prompt(user_question: str, context: list[dict[str, Any]]) -> str:
     """Combine user query with retrieved context into a formatted prompt."""
-    #TODO:
-    # 1. Prepare context from users JSONs in the same way as in `no_grounding.py` `join_context` method (collect as one string)
-    # 2. Make augmentation for USER_PROMPT
-    # 3. print augmented prompt
-    # 3. return augmented prompt
-    raise NotImplementedError
+    print(f"Augmenting prompt for question: {user_question}")
+
+    # Format context
+    formatted_context = []
+    for user in context:
+        user_info = "\n".join([f"  {key}: {value}" for key, value in user.items()])
+        formatted_context.append(f"User:\n{user_info}")
+    context_string = "\n\n".join(formatted_context)
+
+    # Combine with user question
+    augmented_prompt = USER_PROMPT.format(context=context_string, query=user_question)
+    print(f"Augmented prompt: {augmented_prompt}")
+    return augmented_prompt
 
 
-def generate_answer(augmented_prompt: str) -> str:
-    """Generate final answer using the augmented prompt."""
-    #TODO:
-    # 1. Create messages array with:
-    #       - SYSTEM_PROMPT
-    #       - augmented_prompt
-    # 2. Generate response, use invoke method with llm_client
-    # 3. Return response content
-    raise NotImplementedError
+# Fix the response handling in `generate_answer`
+async def generate_answer(augmented_prompt: str) -> str:
+    print(f"Generating answer for augmented prompt: {augmented_prompt}")
+
+    # Create messages array
+    messages = [
+        SystemMessage(content=SYSTEM_PROMPT),
+        HumanMessage(content=augmented_prompt)
+    ]
+
+    # Generate response
+    try:
+        response = await llm_client.ainvoke(messages)
+        return response.content
+    except Exception as e:
+        print(f"Error during answer generation: {e}")
+        return "Error generating response."
 
 
-def main():
+async def main():
     print("Query samples:")
     print(" - I need user emails that filled with hiking and psychology")
     print(" - Who is John?")
     print(" - Find users with surname Adams")
     print(" - Do we have smbd with name John that love painting?")
 
-    #TODO:
-    # 1. Create infinite loop
-    # 2. Get input from console as `user_question`
-    # 3. retrieve context
-    # 4. if context is present:
-    #       - make augmentation
-    #       - generate answer with augmented prompt
-    # 5. Otherwise print `No relevant information found`
-    raise NotImplementedError
+    while True:
+        try:
+            user_question = input("Enter your query: ").strip()
+            if not user_question:
+                print("No query provided. Exiting.")
+                break
+
+            # Retrieve context
+            context = retrieve_context(user_question)
+
+            if context:
+                # Confirm before augmenting prompt
+                proceed = input("Context retrieved. Do you want to proceed with augmenting the prompt? (yes/no): ").strip().lower()
+                if proceed != 'yes':
+                    print("Process aborted by user.")
+                    continue
+
+                # Augment prompt
+                augmented_prompt = augment_prompt(user_question, context)
+
+                # Confirm before generating answer
+                proceed = input("Prompt augmented. Do you want to proceed with generating the answer? (yes/no): ").strip().lower()
+                if proceed != 'yes':
+                    print("Process aborted by user.")
+                    continue
+
+                # Generate answer
+                answer = await generate_answer(augmented_prompt)
+                print(f"Answer: {answer}")
+            else:
+                print("No relevant information found.")
+        except KeyboardInterrupt:
+            print("\nProcess interrupted by user.")
+            break
+        except Exception as e:
+            print(f"Unexpected error: {e}")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
 
 
 # The problems with API based Grounding approach are:
