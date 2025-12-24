@@ -63,6 +63,11 @@ class InOutRAG:
         # Load or create vectorstore (run blocking IO in thread)
         self.vectorstore = await asyncio.to_thread(self._load_or_create_vectorstore)
         print(f"   ✓ Vectorstore ready ({time.time() - start:.2f}s)")
+        try:
+            count = self.vectorstore._collection.count()
+        except Exception:
+            count = 'unknown'
+        print(f"   ℹ️  Vectorstore contains {count} documents (approx)")
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -75,12 +80,14 @@ class InOutRAG:
             # If collection empty, create from users
             # Use the collection count to determine if we need a cold start.
             if not chroma._collection.count():
+                print("   ⚠️  Existing vectorstore is empty or uninitialized, will build from User Service...")
                 raise RuntimeError("empty")
             return chroma
         except Exception:
-            # Build from users
+            print("   ⏳ Building vectorstore from User Service (cold start)")
             user_client = UserClient()
             users = user_client.get_all_users()
+            print(f"   ℹ️  Retrieved {len(users)} users from User Service")
             documents = [Document(page_content=format_user_document(u), metadata={"user_id": u.get("id")}) for u in users]
             chroma = Chroma(persist_directory=self.persist_dir, embedding_function=self.embeddings)
             chroma.add_documents(documents)
@@ -96,13 +103,16 @@ class InOutRAG:
                 except Exception:
                     # best-effort: if persistence is not supported, continue
                     pass
+            print("   ✓ Vectorstore built and persisted (if supported)")
             return chroma
 
     async def _update_vectorstore_with_diffs(self):
         # Fetch latest users in thread
+        print("🔁 Checking for updates in User Service to sync vectorstore...")
         user_client = UserClient()
         users = await asyncio.to_thread(user_client.get_all_users)
         current_ids = {u.get("id") for u in users}
+        print(f"   ℹ️  Fetched {len(users)} users; computing diffs...")
 
         # Get ids in vectorstore
         # Chroma stores ids as strings; normalize both sides to sets of strings
@@ -115,11 +125,13 @@ class InOutRAG:
         to_add = current_ids_str - vs_ids
 
         if to_delete:
+            print(f"   🗑️  Removing {len(to_delete)} deleted users from vectorstore")
             self.vectorstore.delete(ids=list(to_delete))
 
         if to_add:
             # Convert back to original users by comparing stringified ids
             add_docs = [Document(page_content=format_user_document(u), metadata={"user_id": u.get("id")}) for u in users if str(u.get("id")) in to_add]
+            print(f"   ➕ Adding {len(add_docs)} new users to vectorstore")
             self.vectorstore.add_documents(add_docs)
 
         # Persist changes if the API exposes a persist method. Be tolerant
@@ -131,17 +143,25 @@ class InOutRAG:
                 self.vectorstore._client.persist()
             except Exception:
                 pass
+        print("   ✓ Vectorstore sync complete")
 
     async def retrieve_context(self, query: str, k: int = 50, score: float = 0.1) -> List[Document]:
         # Keep the vectorstore in sync before search
+        print(f"🔎 Performing similarity search for query: '{query}' (k={k})")
         await self._update_vectorstore_with_diffs()
 
         results = self.vectorstore.similarity_search(query, k=k)
+        print(f"   ℹ️  Retrieved {len(results)} candidate documents from vectorstore")
+        # Show short previews for user awareness (first 3)
+        for i, d in enumerate(results[:3]):
+            snippet = d.page_content.replace('\n', ' ')[:200]
+            print(f"     [{i+1}] {snippet}...")
         # Chroma may not return scores depending on version; wrap as Documents
         return results
 
     async def perform_entity_extraction(self, docs: List[Document]) -> Dict[str, List[int]]:
         # Build compact prompt for LLM
+        print("🧠 Sending candidate snippets to LLM for hobby extraction...")
         texts = "\n\n".join([d.page_content for d in docs])
         # Instruct LLM to return a strict JSON structure mapping hobby -> [user_ids]
         prompt = f"Given the following user snippets with user_id, extract hobbies and map them to user ids in JSON as { '{"matches": {"hobby": [ids]}}' }:\n\n{texts}\n\nReturn only valid JSON matching schema."
@@ -152,10 +172,13 @@ class InOutRAG:
         ]
 
         response = self.llm_client.invoke(messages)
+        print("   ℹ️  Received response from LLM (raw):")
+        print(f"   {response.content[:1000]}")
         parser = PydanticOutputParser(pydantic_object=ExtractionModel)
         try:
             # Prefer validated pydantic parsing to ensure ids are ints
             parsed = parser.parse(response.content)
+            print("   ✓ LLM output parsed to expected schema")
             return parsed.matches
         except Exception:
             # If parser fails, try to load as JSON
@@ -163,14 +186,18 @@ class InOutRAG:
 
             try:
                 data = json.loads(response.content)
+                print("   ⚠️  LLM output did not fully validate; falling back to raw JSON parsing")
                 return data.get("matches", {})
             except Exception:
+                print("   ❌ Failed to parse LLM output as JSON; returning empty extraction")
                 return {}
 
     async def output_grounding_and_fetch_users(self, extraction: Dict[str, List[int]]) -> Dict[str, List[dict]]:
+        print("🔗 Performing output grounding: verifying IDs and fetching full user records...")
         user_client = UserClient()
         result: Dict[str, List[dict]] = {}
         for hobby, ids in extraction.items():
+            print(f"   🔎 Hobby: '{hobby}' -> {len(ids)} candidate ids")
             users = []
             for uid in ids:
                 try:
@@ -182,10 +209,16 @@ class InOutRAG:
                         user = await user_client.get_user(uid_int)
                     else:
                         user = await asyncio.to_thread(user_client.get_user, uid_int)
-                    users.append(user)
+                    if user:
+                        users.append(user)
+                        print(f"     ✓ Found user id={uid_int}")
+                    else:
+                        print(f"     ⚠️  User id={uid_int} not found or deleted")
                 except Exception:
+                    print(f"     ❌ Error fetching user id={uid} - skipping")
                     continue
             result[hobby] = users
+            print(f"   ✅ Completed hobby '{hobby}' - collected {len(users)} users")
         return result
 
 
@@ -220,7 +253,9 @@ async def main():
             docs = await rag.retrieve_context(q)
             extraction = await rag.perform_entity_extraction(docs)
             grounded = await rag.output_grounding_and_fetch_users(extraction)
-            print("Result:", grounded)
+            print("\nFinal Result (count of users grouped by hobby):")
+            for hobby, users in grounded.items():
+                print(f"{hobby}: {len(users)} users")
 
 
 if __name__ == '__main__':
